@@ -1,0 +1,231 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Template to monitor S3 copy events via CloudTrail and EventBridge with Step Function response
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Name of the S3 bucket to monitor for copy events
+    Default: raphabot-no-ransomware
+
+Resources:
+  # EventBridge IAM Role for Step Function target
+  EventBridgeStepFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: InvokeStepFunctionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref CopyObjectEventHandlerStateMachine
+
+  # Step Function IAM Role
+  StateMachineExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: DisableUserPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - iam:UpdateAccessKey
+                  - iam:AttachRolePolicy
+                  - iam:PutRolePolicy
+                Resource: "*"
+  # Step Function Definition
+  CopyObjectEventHandlerStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      RoleArn: !GetAtt StateMachineExecutionRole.Arn
+      DefinitionString: |
+        {
+          "Comment": "State machine that handles IAM users (rotate keys) or quarantines IAM roles that triggered S3 copy events",
+          "StartAt": "IdentifyPrincipalType",
+          "States": {
+            "IdentifyPrincipalType": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Next": "DisableActiveKeys",
+                  "Variable": "$.detail.userIdentity.type",
+                  "StringEquals": "IAMUser"
+                },
+                {
+                  "Next": "Parallel",
+                  "Variable": "$.detail.userIdentity.type",
+                  "StringEquals": "AssumedRole"
+                }
+              ],
+              "Default": "UnsupportedPrincipalType"
+            },
+            "Parallel": {
+              "Type": "Parallel",
+              "Branches": [
+                {
+                  "StartAt": "QuarantineIAMRole",
+                  "States": {
+                    "QuarantineIAMRole": {
+                      "Type": "Task",
+                      "Resource": "arn:aws:states:::aws-sdk:iam:attachRolePolicy",
+                      "Parameters": {
+                        "RoleName.$": "States.ArrayGetItem(States.StringSplit($.detail.userIdentity.arn, '/'), 1)",
+                        "PolicyArn": "arn:aws:iam::aws:policy/AWSCompromisedKeyQuarantineV3"
+                      },
+                      "ResultPath": "$.quarantineResult",
+                      "End": true
+                    }
+                  }
+                },
+                {
+                  "StartAt": "PutRolePolicy",
+                  "States": {
+                    "PutRolePolicy": {
+                      "Type": "Task",
+                      "Parameters": {
+                        "RoleName.$": "States.ArrayGetItem(States.StringSplit($.detail.userIdentity.arn, '/'), 1)",
+                        "PolicyName": "block-s3-putobject",
+                        "PolicyDocument": {
+                          "Version": "2012-10-17",
+                          "Statement": [
+                            {
+                              "Effect": "Deny",
+                              "Action": "s3:PutObject",
+                              "Resource": "*"
+                            }
+                          ]
+                        }
+                      },
+                      "Resource": "arn:aws:states:::aws-sdk:iam:putRolePolicy",
+                      "End": true
+                    }
+                  }
+                }
+              ],
+              "End": true
+            },
+            "DisableActiveKeys": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:iam:updateAccessKey",
+              "Parameters": {
+                "AccessKeyId.$": "$.detail.userIdentity.accessKeyId",
+                "Status": "Inactive",
+                "UserName.$": "$.detail.userIdentity.userName"
+              },
+              "End": true
+            },
+            "UnsupportedPrincipalType": {
+              "Type": "Pass",
+              "Comment": "Only IAM Users and Assumed Roles are supported",
+              "End": true
+            }
+          }
+        }
+
+  # CloudTrail with specific event selector for copy operations
+  S3CopyActivityTrail:
+    Type: AWS::CloudTrail::Trail
+    DependsOn:
+      - CloudTrailBucketPolicy
+    Properties:
+      IsLogging: true
+      IncludeGlobalServiceEvents: false  # Only S3 events
+      EnableLogFileValidation: true
+      TrailName: !Sub "S3CopyMonitor-${AWS::StackName}"
+      EventSelectors:
+        - ReadWriteType: WriteOnly
+          DataResources:
+            - Type: AWS::S3::Object
+              Values:
+                - !Sub "arn:aws:s3:::${BucketName}/"
+          IncludeManagementEvents: false
+          ExcludeManagementEventSources: []
+      S3BucketName: !Ref CloudTrailBucket
+      S3KeyPrefix: "s3-copy-events"
+
+  # S3 Bucket for CloudTrail logs
+  CloudTrailBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "s3-copy-events-${AWS::AccountId}-${AWS::Region}"
+      AccessControl: LogDeliveryWrite
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # S3 Bucket Policy for CloudTrail
+  CloudTrailBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref CloudTrailBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:PutObject
+            Resource: !Sub "${CloudTrailBucket.Arn}/*"
+          - Effect: Allow
+            Principal:
+              Service: cloudtrail.amazonaws.com
+            Action: s3:GetBucketAcl
+            Resource: !Sub "${CloudTrailBucket.Arn}"
+
+  # EventBridge Rule with precise filtering
+  S3CopyEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub "s3-copy-rule-${BucketName}"
+      Description: "Triggers on S3 copy operations detected by CloudTrail"
+      EventPattern:
+        source: ["aws.s3"]
+        detail-type: ["AWS API Call via CloudTrail"]
+        detail:
+          eventSource: ["s3.amazonaws.com"]
+          eventName: 
+            - "CopyObject"
+            - "CompleteMultipartUpload"
+          requestParameters:
+            bucketName: [!Ref BucketName]
+      Targets:
+        - Arn: !Ref CopyObjectEventHandlerStateMachine
+          Id: "CopyEventHandler"
+          RoleArn: !GetAtt EventBridgeStepFunctionRole.Arn
+
+Outputs:
+  StateMachineArn:
+    Description: "Step Function that handles copy events"
+    Value: !Ref CopyObjectEventHandlerStateMachine
+  CloudTrailName:
+    Description: "CloudTrail trail monitoring copy operations"
+    Value: !Ref S3CopyActivityTrail
+  EventRuleARN:
+    Description: "EventBridge rule ARN"
+    Value: !GetAtt S3CopyEventRule.Arn
