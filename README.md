@@ -1,6 +1,6 @@
 # S3 Ransomware Simulator
 
-This project is divede in two parts: the actual S3 Ransomware Simulator, and a Cloud Detection and Response (CDR) suggested Infrastructure as Code for this type of attack.
+This project is divided in two parts: the actual S3 Ransomware Simulator, and a Cloud Detection and Response (CDR) suggested Infrastructure as Code for this type of attack.
 
 
 ## Simulator
